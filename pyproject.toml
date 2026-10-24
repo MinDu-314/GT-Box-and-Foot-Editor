@@ -1,2 +1,2 @@
 [tool.vercel]
-entrypoint = "gt_editor_standalone.py"
+entrypoint = "gt_editor_standalone:app"
