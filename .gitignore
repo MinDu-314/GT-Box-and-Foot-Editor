@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Large video files (keep directory structure with .gitkeep)
+videos_source/*
+!videos_source/.gitkeep
+
+videos_v4_preview/*
+!videos_v4_preview/.gitkeep
+
+# Exclude standalone media captures if needed
+*.mp4
+*.MP4
+*.mov
+*.MOV
+!videos_source/.gitkeep
+!videos_v4_preview/.gitkeep
