@@ -14,11 +14,14 @@
 """
 from __future__ import annotations
 
+import http.cookiejar
 import json
+import re
 import socket
 import sys
 import threading
 import urllib.parse
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +34,79 @@ PKG_ROOT = Path(__file__).resolve().parent
 VIDEOS_DIR = PKG_ROOT / "videos_source"
 GT_DIR = PKG_ROOT / "output_ground_truth"
 GT_DIR.mkdir(parents=True, exist_ok=True)
+VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def extract_gdrive_id(url_or_id: str) -> str:
+    s = url_or_id.strip()
+    m = re.search(r"/(?:file/d/|open\?id=|uc\?id=)([a-zA-Z0-9_-]{20,})", s)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"id=([a-zA-Z0-9_-]{20,})", s)
+    if m2:
+        return m2.group(1)
+    if re.match(r"^[a-zA-Z0-9_-]{25,}$", s):
+        return s
+    return s
+
+
+def download_from_gdrive(url_or_id: str, dest_path: Path) -> int:
+    file_id = extract_gdrive_id(url_or_id)
+    tmp_path = dest_path.with_suffix(".tmp_download")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    # If it is a direct non-Google Drive URL
+    if url_or_id.startswith("http") and ("drive.google.com" not in url_or_id and "docs.google.com" not in url_or_id):
+        req = urllib.request.Request(url_or_id, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req) as resp, open(tmp_path, "wb") as out_f:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+    else:
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        download_url = f"https://docs.google.com/uc?export=download&id={file_id}"
+        req = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+        resp = opener.open(req)
+
+        content_type = resp.headers.get("Content-Type", "")
+        # Check if Google Drive returned a virus scan warning confirmation page
+        if "text/html" in content_type:
+            html = resp.read().decode("utf-8", errors="ignore")
+            confirm_m = re.search(r"confirm=([0-9A-Za-z_-]+)", html)
+            if confirm_m:
+                download_url = f"https://docs.google.com/uc?export=download&confirm={confirm_m.group(1)}&id={file_id}"
+            else:
+                form_m = re.search(r'action="([^"]+)"', html)
+                if form_m:
+                    download_url = form_m.group(1).replace("&amp;", "&")
+                else:
+                    href_m = re.search(r'href="(https://drive\.usercontent\.google\.com/download[^"]+)"', html)
+                    if href_m:
+                        download_url = href_m.group(1).replace("&amp;", "&")
+            req = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = opener.open(req)
+
+        with open(tmp_path, "wb") as out_f:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+
+    if not tmp_path.exists() or tmp_path.stat().st_size < 1000:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise ValueError("Download failed or file is too small. Please ensure the Google Drive file is set to 'Anyone with the link can view'.")
+
+    if dest_path.exists():
+        dest_path.unlink()
+    tmp_path.replace(dest_path)
+    return dest_path.stat().st_size
+
 
 # Official BTC 4-Point Court Registration on 720p (1280x720):
 #   RKU0 : (1113, 379) -> (0, 0)
@@ -228,6 +304,36 @@ class VideoStore:
         df[["frame", "court_x", "court_y", "team", "jersey"]].to_csv(txt_p, index=False, header=False, float_format="%.2f")
         return {"saved_csv": str(csv_p), "saved_txt": str(txt_p), "edited_boxes": n_edited}
 
+    def replace_video_source(self, vid: str, url_or_id: str) -> dict:
+        dest_p = VIDEOS_720P.get(vid, VIDEOS_DIR / f"{vid}.MP4")
+        with self.lock:
+            if vid in self.caps and self.caps[vid] is not None:
+                try:
+                    self.caps[vid].release()
+                except Exception:
+                    pass
+                del self.caps[vid]
+            self.last_pos.pop(vid, None)
+
+        bytes_dl = download_from_gdrive(url_or_id, dest_p)
+        mb = round(bytes_dl / (1024 * 1024), 2)
+
+        with self.lock:
+            cap = cv2.VideoCapture(str(dest_p))
+            if not cap.isOpened():
+                raise ValueError("Downloaded file is not a valid video.")
+            self.caps[vid] = cap
+            self.last_pos[vid] = 0
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        return {
+            "ok": True,
+            "message": f"Đã tải thành công và thay thế {vid}.MP4 ({mb} MB, {count} frames @ {round(fps, 1)} fps)!",
+            "size_mb": mb,
+            "frames": count,
+        }
+
 
 STORE: VideoStore | None = None
 
@@ -287,6 +393,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </label>
   <button class="warn" onclick="jumpBookmark(-1)">⏮ Prev Occlusion (P)</button>
   <button class="warn" onclick="jumpBookmark(1)">⏭ Next Occlusion (N)</button>
+  <button class="primary" onclick="openGdriveModal()" style="background: linear-gradient(135deg, #0284c7, #2563eb); border-color: #38bdf8;">📥 Nạp Video (Drive)</button>
   <button class="success" onclick="saveGT()">💾 Lưu GT (Ctrl+S)</button>
   <button class="primary" onclick="downloadGT()">⬇️ Tải File Chuẩn (.txt)</button>
   <span id="saveStatus" class="status">Sẵn sàng</span>
@@ -863,8 +970,90 @@ window.addEventListener("keydown", (evt) => {
   }
 });
 
+function openGdriveModal() {
+  document.getElementById("gdriveTargetVid").value = curVid;
+  document.getElementById("gdriveModal").style.display = "flex";
+  document.getElementById("gdriveUrlInput").focus();
+}
+
+function closeGdriveModal() {
+  document.getElementById("gdriveModal").style.display = "none";
+  document.getElementById("gdriveProgress").style.display = "none";
+  document.getElementById("gdriveSubmitBtn").disabled = false;
+}
+
+async function submitGdriveVideo() {
+  const url = document.getElementById("gdriveUrlInput").value.trim();
+  const targetVid = document.getElementById("gdriveTargetVid").value;
+  if (!url) {
+    alert("Vui lòng nhập link Google Drive hoặc File ID!");
+    return;
+  }
+  const progEl = document.getElementById("gdriveProgress");
+  const submitBtn = document.getElementById("gdriveSubmitBtn");
+  progEl.style.display = "block";
+  progEl.textContent = `⏳ Đang tải video cho ${targetVid} từ Google Drive và thay thế file gốc... Quá trình có thể mất 30-60 giây tùy dung lượng.`;
+  submitBtn.disabled = true;
+
+  try {
+    const res = await fetch("/api/replace_video", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video: targetVid, url: url })
+    });
+    const result = await res.json();
+    if (result.ok) {
+      alert(`✅ ${result.message}`);
+      closeGdriveModal();
+      document.getElementById("gdriveUrlInput").value = "";
+      if (curVid === targetVid) {
+        await goToFrame(curFrame);
+      }
+    } else {
+      alert(`❌ Lỗi tải video: ${result.error || "Không thể tải video"}`);
+      progEl.style.display = "none";
+      submitBtn.disabled = false;
+    }
+  } catch (err) {
+    alert(`❌ Lỗi kết nối: ${err.message}`);
+    progEl.style.display = "none";
+    submitBtn.disabled = false;
+  }
+}
+
 initVideoMeta();
 </script>
+
+<!-- Google Drive Video Loader Modal -->
+<div id="gdriveModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center;">
+  <div style="background:#1e293b; border:1px solid #475569; border-radius:10px; width:480px; padding:20px; box-shadow:0 10px 25px rgba(0,0,0,0.6);">
+    <h3 style="margin-top:0; color:#38bdf8; display:flex; justify-content:space-between; align-items:center;">
+      <span>📥 Nạp Video từ Google Drive</span>
+      <span style="cursor:pointer; color:#94a3b8; font-size:18px;" onclick="closeGdriveModal()">✖</span>
+    </h3>
+    <p style="font-size:12.5px; color:#cbd5e1; line-height:1.5;">
+      Dán link chia sẻ Google Drive (hoặc File ID). Video tải về sẽ tự động ghi đè vào thư mục <code>videos_source/</code> để công cụ đọc frame trực tiếp.
+    </p>
+    <div style="margin:12px 0;">
+      <label style="font-size:12px; color:#94a3b8; font-weight:600;">Video đích để thay thế:</label>
+      <select id="gdriveTargetVid" style="width:100%; margin-top:4px;">
+        <option value="IMG_0114">IMG_0114 (videos_source/IMG_0114.MP4)</option>
+        <option value="IMG_0115">IMG_0115 (videos_source/IMG_0115.MP4)</option>
+      </select>
+    </div>
+    <div style="margin:12px 0;">
+      <label style="font-size:12px; color:#94a3b8; font-weight:600;">Link Google Drive / File ID / Direct URL:</label>
+      <input id="gdriveUrlInput" type="text" placeholder="https://drive.google.com/file/d/.../view?usp=sharing" style="width:100%; margin-top:4px; box-sizing:border-box;"/>
+    </div>
+    <div id="gdriveProgress" style="display:none; font-size:12px; color:#38bdf8; margin:10px 0; font-weight:600;">
+      ⏳ Đang tải video từ Google Drive... vui lòng đợi trong giây lát...
+    </div>
+    <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:16px;">
+      <button onclick="closeGdriveModal()">Hủy</button>
+      <button id="gdriveSubmitBtn" class="primary" onclick="submitGdriveVideo()">Tải & Thay Thế Video</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 """
@@ -955,6 +1144,12 @@ class GTHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/save":
             info = STORE.save_video_gt(payload["video"])
             self._send_json(info)
+        elif self.path == "/api/replace_video":
+            try:
+                res = STORE.replace_video_source(payload["video"], payload["url"])
+                self._send_json(res)
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)})
         else:
             self.send_error(404)
 
