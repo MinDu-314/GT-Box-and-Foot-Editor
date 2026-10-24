@@ -1,12 +1,11 @@
 [project]
 name = "gt-box-and-foot-editor"
 version = "0.1.0"
-requires-python = ">=3.12"
+description = "3x3 Basketball Ground-Truth Box & Trajectory Editor"
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
     "opencv-python-headless>=4.8.0",
     "numpy>=1.24.0",
     "pandas>=2.0.0",
 ]
-
-[tool.vercel]
-entrypoint = "gt_editor_standalone:app"
